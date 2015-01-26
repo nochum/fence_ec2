@@ -1,15 +1,19 @@
 #!/bin/bash
 
+export JAVA_HOME=/usr/java/jdk1.8.0_25
+export EC2_HOME=/usr/local/ec2/ec2-api-tools-1.7.3.0
+export AWS_ACCESS_KEY=<access_key>
+export AWS_SECRET_KEY=<secret_key>
+
 description="
 fence_ec2 is an I/O Fencing agent which can be used with Amazon EC2 instances.
 In order to function, the agent needs the private key and cert used by the Amazon EC2 API.
 
 API functions used by this agent:
-- ec2-describe-tags
 - ec2-describe-instances
-- ec2-stop-instances
+- ec2-describe-tags
 - ec2-start-instances
-- ec2-reboot-instances
+- ec2-stop-instances
 
 If the uname used by the cluster node is any of:
  - Public DNS name (or part there of),
@@ -21,7 +25,13 @@ then the agent should be able to automatically discover the instances it can con
 If the tag containing the uname is not [Name], then it will need to be specified using the [tag] option.
 "
 
-#
+# Extensive adaptations by Nochum Klein to Andrew Beekhof's original
+# work.
+# - AWS has deprecated the SOAP interface and x.509 certificates.  This
+#   version supports the aws_secret_key.
+# - Modified some bash constructs.
+# - Changed to ensure that the script always returns a value.
+# 
 # Copyright (c) 2011 Andrew Beekhof
 #                    All Rights Reserved.
 #
@@ -46,16 +56,12 @@ If the tag containing the uname is not [Name], then it will need to be specified
 #
 #######################################################################
 
-quiet=0
 port=""
-
-instance_not_found=0
-unknown_are_stopped=0
 
 action="reset"         # Default fence action
 ec2_tag="Name"	       # EC2 Tag containing the instance's uname
-ec2_key=""	       # EC2 Private Key
-ec2_cert=""	       # EC2 Cert
+ec2_access_key="${AWS_ACCESS_KEY}"      # EC2 Access Key
+ec2_private_key="${AWS_SECRET_KEY}"     # EC2 Private Key
 ec2_region="us-east-1" # EC2 Region
 
 
@@ -63,18 +69,17 @@ if [ -z "$EC2_HOME" ]; then
     EC2_HOME="$HOME/.ec2"
 fi
 
-function usage()
+usage()
 {
 cat <<EOF
-`basename $0` - A fencing agent for Amazon EC2 instances
+$(basename "$0") - A fencing agent for Amazon EC2 instances
  
 $description
  
-Usage: `basename $0` -o|--action [-n|--port] [options]
+Usage: $(basename "$0") -o|--action [-n|--port] [options]
 Options:
  -h, --help 		This text
  -V, --version		Version information
- -q, --quiet 		Reduced output mode
  
 Commands:
  -o, --action		Action to perform: on|off|reboot|status|monitor
@@ -82,19 +87,15 @@ Commands:
 
 Additional Options:
  -e, --ec2-home 	Location of Amazon EC2 command line tools
+ -c, --access-key 	The access key to use when constructing requests to Amazon EC2
  -k, --private-key 	The private key to use when constructing requests to Amazon EC2
- -c, --cert 		The X.509 certificate to use when constructing requests to Amazon EC2
  -r, --region		The Amazon region for which the device should control instances (defaults to us-east-1)
  -t, --tag 		Name of the tag containing the instance's uname
 
-Dangerous options:
- -U, --unknown-are-stopped 	Assume any unknown instance is safely stopped
-
 EOF
-    exit 0;
 }
 
-function metadata()
+metadata()
 {
 cat <<EOF
 <?xml version="1.0" ?>
@@ -138,11 +139,6 @@ $description
 		<content type="string" default="Name" />
 		<shortdesc lang="en">Name of the tag containing the instances uname</shortdesc>
 	</parameter>
-	<parameter name="unknown-are-stopped" unique="1" required="0">
-		<getopt mixed="-U, --unknown-are-stopped" />
-		<content type="string" default="false" />
-		<shortdesc lang="en">DANGER: Assume any unknown instance is safely stopped</shortdesc>
-	</parameter>
     </parameters>
     <actions>
 	<action name="on" />
@@ -158,49 +154,190 @@ EOF
     exit 0;
 }
 
-function instance_for_port()
+instance_for_port()
 {
     port=$1; shift
 
     # Look for port name -n in the INSTANCE data
-    instance=`ec2-describe-instances $* | grep INSTANCE.*$port | awk '{print $2}'`	
-    if [ -z $instance ]; then
+    instance=$(ec2-describe-instances "$@" | grep "INSTANCE.*$port" | awk '{print $2}')
+    if [ -z "${instance}" ]; then
 	# Look for port name -n in the Name TAG
-	instance=`ec2-describe-tags $* | grep TAG.*instance.*$ec2_tag.*$port | awk '{print $3}'`
+	instance=$(ec2-describe-tags "$@" | grep "TAG.*instance.*$ec2_tag.*$port" | awk '{print $3}')
     fi
 
-    if [ -z $instance ]; then
-	instance_not_found=1
+    if [ -z "${instance}" ]; then
 	instance=$port
     fi
 
-    echo $instance
+    echo "${instance}"
 }
 
-TEMP=`getopt -o qVo:e:k:c:r:n:t:U -l version,help,region:,action:,port:,option:,ec2-home:,private-key:,cert:,tag:,quiet,unknown-are-stopped \
-     -n 'fence_ec2' -- "$@"`
+# sets the instance_state variable.  valid instance states are: 
+#   pending | running | shutting-down | terminated | stopping | stopped
+get_instance_state()
+{
+    instance_state=""
+    instance_info=$(ec2-describe-instances "${instance}" | grep ^INSTANCE)
+    if [[ ${instance_info} == *"pending"* ]]
+    then
+        instance_state="pending"
+    elif [[ ${instance_info} == *"running"* ]]
+    then
+        instance_state="running"
+    elif [[ ${instance_info} == *"shutting-down"* ]]
+    then
+        instance_state="shutting-down"
+    elif [[ ${instance_info} == *"terminated"* ]]
+    then
+        instance_state="terminated"
+    elif [[ ${instance_info} == *"stopping"* ]]
+    then
+        instance_state="stopping"
+    elif [[ ${instance_info} == *"stopped"* ]]
+    then
+        instance_state="stopped"
+    fi
+}
+
+# waits for the stat of an ec2 instance to be 'stopped'
+wait_for_stop()
+{
+    while [ ${instance_state} -ne "stopped" ]
+    do
+        echo "Waiting until instance $instance aka $port is stopped."
+        get_instance_state
+        sleep 1
+    done
+}
+
+# this is a combination of a 'stop' operation followed by a 'start' operation.
+ec2_reset()
+{
+    ec2_stop
+    
+    # avoid an additional call to get the instance state (ec2-describe-instances)
+    if [ "${RETVAL}" -eq 0 ]
+    then
+        echo "Starting $instance."
+        ec2-start-instances --region "${ec2_region}" --aws-access-key "${ec2_access_key}" --aws-secret-key "${ec2_private_key}" "${instance}"
+        return 0
+    fi
+}
+
+# Force stop of instance, wait for success.  Return values:
+#   0 if the operation was successful
+#   1 if not successful or verification could not be performed.
+ec2_stop()
+{
+    get_instance_state
+    
+    if [ ${instance_state} = "stopped" ]
+    then
+        return 0
+    elif [ ${instance_state} = "stopping" ]
+    then
+        wait_for_stop
+        return 0
+    elif [ ${instance_state} = "pending" -o ${instance_state} = "running" ]
+    then
+        ec2-stop-instances --region "${ec2_region}" --aws-access-key "${ec2_access_key}" --aws-secret-key "${ec2_private_key}" "${instance}" --force
+        wait_for_stop
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Start the instance.  Return values:
+#   0 if the operation was successful
+#   1 if not successful or verification could not be performed.
+ec2_start()
+{
+    get_instance_state
+    
+    if [ ${instance_state} = "stopped" -o ${instance_state} = "stopping" ]
+    then
+        echo "Starting $instance."
+        ec2-start-instances --region "${ec2_region}" --aws-access-key "${ec2_access_key}" --aws-secret-key "${ec2_private_key}" "${instance}"
+        return 0
+    elif [ ${instance_state} = "pending" -o ${instance_state} = "running" ]
+    then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Multi-port fencing devices only. Prints a list of port names and assignments. Return values:
+#   0 if the fence device is reachable and working properly
+#   1 if the fence device could not be contacted
+ec2_list()
+{
+    # List of names we know about
+    ec2-describe-instances --region "${ec2_region}" --aws-access-key "${ec2_access_key}" --aws-secret-key "${ec2_private_key}" | awk -v tag_pat="^TAG\tinstance\t.*\t$ec2_tag" -F '\t' '{ 
+        if (/^INSTANCE.*pending/) { printf "%s\n", $2 }
+        else if (/^INSTANCE.*stopped/) { printf "%s\n", $2 }
+        else if (/^INSTANCE/) { printf "%s\n%s\n%s\n", $2, $4, $5 }
+        else if ( $1"\t"$2"\t"$3"\t"$4 ~ tag_pat ) { printf "%s\n", $5 }
+    }' | sort -u
+    
+    # Since AWS *is* our "fence device", we will unequivically return 0
+
+    return 0
+}
+
+# This is used by pacemaker to verify that the agent is working. It is not required by 'fenced'. Use is encouraged. Return values:
+#   0 if the fence device is reachable and the port (instance) is in the on state
+#   1 if the fence device could not be contacted
+#   2 if the fence device is reachable but the port (instance) in the off state
+ec2_status()
+{
+    get_instance_state
+    if [ ${instance_state} = "stopped" ]
+    then
+        return 2
+    else
+        return 0
+    fi
+}
+
+# Attempt to contact the fencing device. Typically, 'status' for one-port hardware, and 'list' for multi-port hardware. Return values:
+#   0 if the fence device is reachable and working properly
+#   1 if the fence device could not be contacted
+#   2 if the fence device is reachable but the port (instance) in the off state (single-port hardware only)
+ec2_monitor()
+{
+    get_instance_state
+    if [ ${instance_state} = "stopped" ]
+    then
+        return 2
+    else
+        return 0
+    fi
+}
+
+TEMP=$(getopt -o qVo:e:k:c:r:n:t:U -l version,help,region:,action:,port:,option:,ec2-home:,private-key:,cert:,tag \
+     -n 'fence_ec2' -- "$@")
 
 if [ $? != 0 ];then 
     usage
     exit 1
 fi
 
-# Note the quotes around `$TEMP': they are essential!
+# Note the quotes around '$TEMP': they are essential!
 eval set -- "$TEMP"
 
-if [ -z $2 ]; then
+if [ -z "$2" ]; then
     # If there are no command line args, look for options from stdin
     while read line; do
-	case $line in 
-            option=*|action=*) action=`echo $line | sed s/.*=//`;;
-            port=*)        port=`echo $line | sed s/.*=//`;;
-	    ec2-home=*)    EC2_HOME=`echo $line | sed s/.*=//`;;
-	    private-key=*) ec2_key=`echo $line | sed s/.*=//`;;
-	    cert=*)        ec2_cert=`echo $line | sed s/.*=//`;;
-	    region=*)      ec2_region=`echo $line | sed s/.*=//`;;
-	    tag=*)         ec2_tag=`echo $line | sed s/.*=//`;;
-	    quiet*)        quiet=1;;
-	    unknown-are-stopped*) unknown_are_stopped=1;;
+	case "$line" in 
+            option=*|action=*) action=$(echo "$line" | sed s/.*=//);;
+            port=*)        port=$(echo "$line" | sed s/.*=//);;
+	    ec2-home=*)    EC2_HOME=$(echo "$line" | sed s/.*=//);;
+	    private-key=*) ec2_private_key=$(echo "$line" | sed s/.*=//);;
+	    access-key=*)  ec2_access_key=$(echo "$line" | sed s/.*=//);;
+	    region=*)      ec2_region=$(echo "$line" | sed s/.*=//);;
+	    tag=*)         ec2_tag=$(echo "$line" | sed s/.*=//);;
 	    --);;
 	    *) echo "Invalid command: $line";;
 	esac
@@ -212,12 +349,10 @@ while true ; do
 	-o|--action|--option) action=$2;   shift; shift;;
 	-n|--port)            port=$2;     shift; shift;;
 	-e|--ec2-home)        EC2_HOME=$2; shift; shift;;
-	-k|--private-key)     ec2_key=$2;  shift; shift;;
-	-c|--cert)	      ec2_cert=$2; shift; shift;;
+	-k|--private-key)     ec2_private_key=$2;  shift; shift;;
+	-c|--access-key)      ec2_access_key=$2; shift; shift;;
 	-r|--region)          ec2_region=$2; shift; shift;;
 	-t|--tag)	      ec2_tag=$2; shift; shift;;
-	-U|--unknown-are-stopped) unknown_are_stopped=1; shift;;
-	-q|--quiet) quiet=1; shift;;
 	-V|--version) echo "1.0.0"; exit 0;;
 	--help|-h) 
 	    usage;
@@ -230,92 +365,55 @@ done
 export EC2_HOME
 PATH=$PATH:$EC2_HOME/bin
 
-action=`echo $action | tr 'A-Z' 'a-z'`
+action=$(echo "$action" | tr 'A-Z' 'a-z')
 
 if [ "$action" = "metadata" ]; then
     metadata
 fi
 
 if [ -z "$JAVA_HOME" ]; then
-    java=`which java`
+    java=$(which java)
     while [ -L "$java" ]; do
-	java=`/bin/ls -l $java | awk '{print $11}'`
+	java=$(/bin/ls -l "$java" | awk '{print $11}')
     done
-    export JAVA_HOME=`dirname $java`/..
+    export JAVA_HOME=$(dirname "$java")/..
 fi
 
-if [ -z "$ec2_key" ]; then
-    ec2_key=`ls $EC2_HOME/pk-*.pem`;
+if [ -z "$ec2_private_key" ]; then
+    usage
+    exit 1
 fi
 
-if [ -z "$ec2_cert" ]; then
-    ec2_cert=`ls $EC2_HOME/cert-*.pem`;
+if [ -z "$ec2_access_key" ]; then
+    usage
+    exit 1
 fi
-
-options="--region $ec2_region --private-key $ec2_key --cert $ec2_cert"
 
 instance=""
 if [ ! -z "$port" ]; then
-    instance=`instance_for_port $port $options`
+    instance=$(instance_for_port "$port" --region "${ec2_region}" --aws-access-key "${ec2_access_key}" --aws-secret-key "${ec2_private_key}")
 fi
 
+/usr/bin/logger -p daemon.notice -t "fence_ec2" "Requesting EC2 fence ${instance} (${action})"
+
 case $action in 
-    reboot|reset) 
-	if [ $unknown_are_stopped = 1 -a $instance_not_found ]; then
-	    : nothing we _can_ do
-	    echo "Assuming unknown instance $instance is already off, cannot restart"
-	else
-	    # Force stop of instance, wait for success
-	    ec2-stop-instances $options $instance --force
-	    while ! ec2-describe-instances $options $instance | grep -q stopped ; do
-		echo "Waiting until instance $instance aka $port is stopped."
-		sleep 5
-	    done
-	fi
-	echo "Starting $instance."
-	ec2-start-instances $options $instance
+    reboot|reset)
+        ec2_reset
 	;;
     poweron|on)
-	echo "Starting $instance."
-	ec2-start-instances $options $instance
+        ec2_start
 	;;
     poweroff|off)
-	if [ $unknown_are_stopped = 1 -a $instance_not_found ]; then
-	    : nothing to do
-	    echo "Assuming unknown instance $instance is already off"
-	else
-	    # Force stop of instance, wait for success
-	    ec2-stop-instances $options $instance --force
-	    while ! ec2-describe-instances $options $instance | grep -q stopped ; do
-		echo "Waiting until instance $instance aka $port is stopped."
-		sleep 5
-	    done
-	fi
+        ec2_stop
 	;;
     monitor)
-	# Is the device ok?
-	ec2-describe-instances $options | grep INSTANCE &> /dev/null
+        ec2_monitor
 	;;
     hostlist|list)
-	# List of names we know about
-	ec2-describe-instances $options | awk -v tag_pat="^TAG\tinstance\t.*\t$ec2_tag" -F '\t' '{ 
-               if (/^INSTANCE.*pending/) { printf "%s\n", $2 }
-               else if (/^INSTANCE.*stopped/) { printf "%s\n", $2 }
-               else if (/^INSTANCE/) { printf "%s\n%s\n%s\n", $2, $4, $5 }
-               else if ( $1"\t"$2"\t"$3"\t"$4 ~ tag_pat ) { printf "%s\n", $5 }
-            }' | sort -u
+        ec2_list
 	;;
     stat|status)
-	# List of instances and their current status
-	if [ $unknown_are_stopped = 1 -a $instance_not_found ]; then
-	    echo "$instance stopped (unknown)"
-	else
-	    ec2-describe-instances $options $instance | awk '{ 
-               if (/^INSTANCE.*pending/) { printf "%s %s\n", $2, $4 }
-               else if (/^INSTANCE.*stopped/) { printf "%s %s\n", $2, $4 }
-               else if (/^INSTANCE/) { printf "%s %s %s %s\n", $2, $6, $4, $5 }
-            }'
-	fi
+        ec2_status
 	;;
     metadata)
 	metadata
@@ -323,13 +421,8 @@ case $action in
     *) echo "Unknown action: $action"; exit 1;;
 esac
 
-status=$?
-
-if [ $quiet -eq 1 ]; then
-    : nothing
-elif [ $status -eq 0 ]; then
-    echo "Operation $action passed"
-else
-    echo "Operation $action failed: $status"
+if [ "${RETVAL}" -ne 0 ]
+then
+    /usr/bin/logger -p daemon.notice -t "fence_ec2" "Call to fence ${instance} (${action}) failed with rc=${RETVAL}"
 fi
-exit $status
+exit "${RETVAL}"
